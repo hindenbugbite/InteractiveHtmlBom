@@ -110,6 +110,9 @@ class FusionEagleParser(EcadParser):
             self.angle = float(''.join(d for d in rot_string
                                        if d in string.digits + '.'))
 
+        def __repr__(self):
+            return self.__str__()
+
         def __str__(self):
             return "Mirrored: {0}, Spin: {1}, Angle: {2}".format(self.mirrored,
                                                                  self.spin,
@@ -315,10 +318,10 @@ class FusionEagleParser(EcadParser):
             sx, sy = 0, 0
 
         return {
-             'pos': [x + dx, -y - dy],
-             'angle': _angle,
-             'relpos': [0, 0],
-             'size': [sx, sy]
+            'pos': [x + dx, -y - dy],
+            'angle': _angle,
+            'relpos': [0, 0],
+            'size': [sx, sy]
         }
 
     def _footprint_pads(self, package, x, y, angle, mirrored, refdes):
@@ -402,11 +405,11 @@ class FusionEagleParser(EcadParser):
 
             elif el.tag == 'smd':
                 layer = el.attrib['layer']
-                if layer == '1' and not mirrored or \
-                    layer == '16' and mirrored:
+                if layer == self.TOP_COPPER_LAYER and not mirrored or \
+                        layer == self.BOT_COPPER_LAYER and mirrored:
                     layers = ['F']
-                elif layer == '1' and mirrored or \
-                    layer == '16' and not mirrored:
+                elif layer == self.TOP_COPPER_LAYER and mirrored or \
+                        layer == self.BOT_COPPER_LAYER and not mirrored:
                     layers = ['B']
                 else:
                     self.logger.error('Unable to determine layer for '
@@ -446,7 +449,7 @@ class FusionEagleParser(EcadParser):
                     else:
                         pad['shape'] = 'roundrect'
                         pad['radius'] = (float(el.attrib['roundness']) / 100) \
-                                        * float(el.attrib['dy']) / 2
+                            * float(el.attrib['dy']) / 2
 
                     if self.config.include_nets and \
                             element_pad_nets is not None:
@@ -522,9 +525,10 @@ class FusionEagleParser(EcadParser):
                 elif el.tag == 'rectangle':
                     _dv = self._rectangle_vertices(el)
 
-                    # Rotate rectangle about component origin based on component angle
-                    dv = [self._rotate(_x, _y, -angle, mirrored) for (_x, _y) in
-                          _dv]
+                    # Rotate rectangle about component origin based on
+                    # component angle
+                    dv = [self._rotate(_x, _y, -angle, mirrored)
+                          for (_x, _y) in _dv]
 
                     # Map vertices back to absolute coordinates
                     v = [(x + _x, -y + _y) for (_x, _y) in dv]
@@ -578,68 +582,92 @@ class FusionEagleParser(EcadParser):
                     else:
                         bot = not top
 
-                        # Note that in Eagle terminology, 'mirrored' essentially means
-                        # 'flipped' (i.e. to the opposite side of the board)
+                        # Note that in Eagle terminology, 'mirrored'
+                        # essentially means 'flipped' (i.e. to the opposite
+                        # side of the board)
                         if (mirrored and bot) or (not mirrored and top):
                             dwg_layer['F'].append(dwg)
                         elif (mirrored and top) or (not mirrored and bot):
                             dwg_layer['B'].append(dwg)
 
-    def _element_refdes_to_silk(self, el):
+    def _name_to_silk(self, name, x, y, elr, tr, align, size, ratio):
+        angle = tr.angle
+        mirrored = tr.mirrored
+        spin = elr.spin ^ tr.spin
+        if mirrored:
+            angle = -angle
+
+        if align is None:
+            justify = [-1, 1]
+        elif align == 'center':
+            justify = [0, 0]
+        else:
+            j = align.split('-')
+            alignments = {
+                'bottom': 1,
+                'center': 0,
+                'top': -1,
+                'left': -1,
+                'right': 1
+            }
+            justify = [alignments[ss] for ss in j[::-1]]
+        if (90 < angle <= 270 and not spin) or \
+                (-90 >= angle >= -270 and not spin):
+            angle += 180
+            justify = [-j for j in justify]
+
+        dwg = {
+            'type': 'text',
+            'text': name,
+            'pos': [x, y],
+            'height': size,
+            'width': size,
+            'justify': justify,
+            'thickness': size * ratio,
+            'attr': [] if not mirrored else ['mirrored'],
+            'angle': angle
+        }
+
+        self.font_parser.parse_font_for_string(name)
+        if mirrored:
+            self.pcbdata['drawings']['silkscreen']['B'].append(dwg)
+        else:
+            self.pcbdata['drawings']['silkscreen']['F'].append(dwg)
+
+    def _element_refdes_to_silk(self, el, package):
+        if 'smashed' not in el.attrib:
+            elx = float(el.attrib['x'])
+            ely = -float(el.attrib['y'])
+            for p_el in package.iter('text'):
+                if p_el.text == '>NAME':
+                    dx = float(p_el.attrib['x'])
+                    dy = float(p_el.attrib['y'])
+                    elr = self.Rot(el.get('rot'))
+                    dx, dy = self._rotate(dx, dy, elr.angle, elr.mirrored)
+                    tr = self.Rot(p_el.get('rot'))
+                    tr.angle += elr.angle
+                    tr.mirrored ^= elr.mirrored
+                    self._name_to_silk(
+                        name=el.attrib['name'],
+                        x=elx + dx,
+                        y=ely - dy,
+                        elr=elr,
+                        tr=tr,
+                        align=p_el.get('align'),
+                        size=float(p_el.attrib['size']),
+                        ratio=float(p_el.get('ratio', '8')) / 100)
+
         for attr in el.iter('attribute'):
             if attr.attrib['name'] == 'NAME':
-                attrx = float(attr.attrib['x'])
-                attry = -float(attr.attrib['y'])
-                xpos = attrx
-                ypos = attry
-                elr = self.Rot(el.get('rot'))
-                tr = self.Rot(attr.get('rot'))
-                text = el.attrib['name']
-
-                angle = tr.angle
-                mirrored = tr.mirrored
-                spin = elr.spin ^ tr.spin
-                if mirrored:
-                    angle = -angle
-
-                if 'align' not in attr.attrib:
-                    justify = [-1, 1]
-                elif attr.attrib['align'] == 'center':
-                    justify = [0, 0]
-                else:
-                    j = attr.attrib['align'].split('-')
-                    alignments = {
-                        'bottom': 1,
-                        'center': 0,
-                        'top': -1,
-                        'left': -1,
-                        'right': 1
-                    }
-                    justify = [alignments[ss] for ss in j[::-1]]
-                if (90 < angle < 270 and not spin) or \
-                        (-90 >= angle >= -270 and not spin):
-                    angle += 180
-                    justify = [-j for j in justify]
-
-                size = float(attr.attrib['size'])
-                ratio = float(attr.get('ratio', '8')) / 100
-                dwg = {
-                    'type': 'text',
-                    'text': text,
-                    'pos': [xpos, ypos],
-                    'height': size,
-                    'width': size,
-                    'justify': justify,
-                    'thickness': size * ratio,
-                    'attr': [] if not mirrored else ['mirrored'],
-                    'angle': angle
-                }
-
-                self.font_parser.parse_font_for_string(text)
-                if mirrored:
-                    self.pcbdata['drawings']['silkscreen']['B'].append(dwg)
-                else:
-                    self.pcbdata['drawings']['silkscreen']['F'].append(dwg)
+                self._name_to_silk(
+                    name=el.attrib['name'],
+                    x=float(attr.attrib['x']),
+                    y=-float(attr.attrib['y']),
+                    elr=self.Rot(el.get('rot')),
+                    tr=self.Rot(attr.get('rot')),
+                    align=attr.attrib.get('align'),
+                    size=float(attr.attrib['size']),
+                    ratio=float(attr.get('ratio', '8')) / 100)
 
     @staticmethod
     def _segments_to_polygon(segs, angle=0, mirrored=False):
@@ -694,13 +722,13 @@ class FusionEagleParser(EcadParser):
         try:
             brdxml = ElementTree.parse(brdfile)
         except ElementTree.ParseError as err:
-            self.logger.error("Exception occurred trying to parse {0}, message:"
-                              " {1}"
-                              .format(brdfile.name, err.msg))
+            self.logger.error(
+                "Exception occurred trying to parse {0}, message: {1}"
+                .format(brdfile.name, err.msg))
             return None, None
         if brdxml is None:
-            self.logger.error("No data was able to be parsed from {0}"
-                              .format(brdfile.name))
+            self.logger.error(
+                "No data was able to be parsed from {0}".format(brdfile.name))
             return None, None
 
         # Pick out key sections
@@ -722,8 +750,8 @@ class FusionEagleParser(EcadParser):
             self.min_via_w = 0
         else:
             if len(mv) > 1:
-                self.logger.warning("Multiple rlMinViaOuter found, using first "
-                                    "occurrence")
+                self.logger.warning(
+                    "Multiple rlMinViaOuter found, using first occurrence")
             mv = mv[0]
             mv_val = float(''.join(d for d in mv if d in string.digits + '.'))
             mv_units = (''.join(d for d in mv if d in string.ascii_lowercase))
@@ -777,7 +805,7 @@ class FusionEagleParser(EcadParser):
 
             # For component, get footprint data
             libs = [lib for lib in board.find('libraries').findall('library')
-                       if lib.attrib['name'] == el.attrib['library']]
+                    if lib.attrib['name'] == el.attrib['library']]
             packages = []
             for lib in libs:
                 p = [pac for pac in lib.find('packages').findall('package')
@@ -822,7 +850,7 @@ class FusionEagleParser(EcadParser):
             # Add silkscreen, edges for component footprint & refdes
             self._process_footprint(package, elx, ely, elr.angle, elr.mirrored,
                                     populate)
-            self._element_refdes_to_silk(el)
+            self._element_refdes_to_silk(el, package)
 
             if populate:
                 self.components.append(comp)
